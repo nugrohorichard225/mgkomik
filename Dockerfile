@@ -42,6 +42,8 @@ COPY server.js ./
 
 # Railway uses PORT env variable
 ENV PORT=3000
+# Tell chrome-launcher where Chrome is
+ENV CHROME_PATH=/usr/bin/google-chrome-stable
 
 EXPOSE 3000
 

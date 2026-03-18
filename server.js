@@ -4,8 +4,9 @@ const { JSDOM } = require("jsdom");
 const { URL } = require("url");
 
 // Botasaurus approach: rebrowser-playwright-core + chrome-launcher
-const { chromium } = require("rebrowser-playwright-core");
-const ChromeLauncher = require("chrome-launcher");
+// These are ESM modules, loaded via dynamic import() in init()
+let chromium;
+let ChromeLauncher;
 
 const app = express();
 
@@ -94,6 +95,7 @@ async function launchAntiDetectChrome() {
   // Launch real Chrome via chrome-launcher (like botasaurus page.ts)
   const chrome = await ChromeLauncher.launch({
     chromeFlags: flags,
+    chromePath: process.env.CHROME_PATH || undefined,
   });
 
   // Connect rebrowser-playwright-core via CDP (anti-detect playwright)
@@ -689,32 +691,47 @@ function escapeRegex(string) {
 // ============================================================
 // START SERVER — Pre-solve Cloudflare on startup
 // ============================================================
-app.listen(PORT, async () => {
-  console.log(`🚀 Mirror proxy running on port ${PORT}`);
-  console.log(`📡 Target: ${TARGET_ORIGIN}`);
-  console.log(`💡 Mirror domain: ${MANUAL_MIRROR_DOMAIN || "(auto-detect from request)"}`);
-  console.log(`🔐 Using Botasaurus anti-detect approach for Cloudflare bypass`);
+// ============================================================
+// INIT — Load ESM modules then start server
+// ============================================================
+async function init() {
+  // Dynamic import for ESM-only packages
+  const pw = await import("rebrowser-playwright-core");
+  chromium = pw.chromium;
+  ChromeLauncher = await import("chrome-launcher");
 
-  // Pre-solve Cloudflare cookies on startup
-  try {
-    console.log("[STARTUP] Pre-solving Cloudflare cookies...");
-    await solveCloudflareCookies();
-    console.log("[STARTUP] Cloudflare cookies obtained successfully!");
-  } catch (e) {
-    console.error("[STARTUP] Failed to pre-solve Cloudflare:", e.message);
-    console.log("[STARTUP] Will retry on first request...");
-  }
+  app.listen(PORT, async () => {
+    console.log(`🚀 Mirror proxy running on port ${PORT}`);
+    console.log(`📡 Target: ${TARGET_ORIGIN}`);
+    console.log(`💡 Mirror domain: ${MANUAL_MIRROR_DOMAIN || "(auto-detect from request)"}`);
+    console.log(`🔐 Using Botasaurus anti-detect approach for Cloudflare bypass`);
 
-  // Schedule periodic cookie refresh
-  setInterval(async () => {
+    // Pre-solve Cloudflare cookies on startup
     try {
-      console.log("[REFRESH] Refreshing Cloudflare cookies...");
+      console.log("[STARTUP] Pre-solving Cloudflare cookies...");
       await solveCloudflareCookies();
-      console.log("[REFRESH] Cloudflare cookies refreshed!");
+      console.log("[STARTUP] Cloudflare cookies obtained successfully!");
     } catch (e) {
-      console.error("[REFRESH] Failed to refresh CF cookies:", e.message);
+      console.error("[STARTUP] Failed to pre-solve Cloudflare:", e.message);
+      console.log("[STARTUP] Will retry on first request...");
     }
-  }, CF_COOKIE_REFRESH_MS);
+
+    // Schedule periodic cookie refresh
+    setInterval(async () => {
+      try {
+        console.log("[REFRESH] Refreshing Cloudflare cookies...");
+        await solveCloudflareCookies();
+        console.log("[REFRESH] Cloudflare cookies refreshed!");
+      } catch (e) {
+        console.error("[REFRESH] Failed to refresh CF cookies:", e.message);
+      }
+    }, CF_COOKIE_REFRESH_MS);
+  });
+}
+
+init().catch((err) => {
+  console.error("[FATAL] Failed to initialize:", err);
+  process.exit(1);
 });
 
 // ============================================================
