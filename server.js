@@ -119,8 +119,13 @@ async function launchAntiDetectChrome() {
     "--no-sandbox",
     "--disable-gpu",
     "--disable-setuid-sandbox",
-    "--disable-extensions",
     "--window-size=1920,1080",
+    // Critical anti-detection flags
+    "--disable-blink-features=AutomationControlled",
+    "--disable-features=AutomationControlled",
+    "--disable-ipc-flooding-protection",
+    "--enable-features=NetworkService,NetworkServiceInProcess",
+    "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
     // NO --headless flag! Headed mode is required to bypass Cloudflare
   ];
 
@@ -133,6 +138,78 @@ async function launchAntiDetectChrome() {
   // Connect rebrowser-playwright-core via CDP (anti-detect playwright)
   const browser = await chromium.connectOverCDP(`http://localhost:${chrome.port}`);
   const context = browser.contexts()[0];
+
+  // Inject stealth scripts BEFORE any page loads
+  await context.addInitScript(() => {
+    // Hide webdriver flag
+    Object.defineProperty(navigator, 'webdriver', {
+      get: () => undefined,
+    });
+    // Remove automation-related properties
+    delete navigator.__proto__.webdriver;
+
+    // Add chrome runtime object (missing in automated browsers)
+    if (!window.chrome) {
+      window.chrome = {};
+    }
+    if (!window.chrome.runtime) {
+      window.chrome.runtime = {
+        onMessage: { addListener: function() {}, removeListener: function() {} },
+        sendMessage: function() {},
+        connect: function() { return { onMessage: { addListener: function() {} } }; },
+      };
+    }
+
+    // Override plugins to look real
+    Object.defineProperty(navigator, 'plugins', {
+      get: () => {
+        const plugins = [
+          { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+          { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
+          { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' },
+        ];
+        plugins.length = 3;
+        return plugins;
+      },
+    });
+
+    // Override languages
+    Object.defineProperty(navigator, 'languages', {
+      get: () => ['en-US', 'en', 'id'],
+    });
+
+    // Override permissions
+    const origQuery = navigator.permissions.query.bind(navigator.permissions);
+    navigator.permissions.query = (parameters) => {
+      if (parameters.name === 'notifications') {
+        return Promise.resolve({ state: 'prompt', onchange: null });
+      }
+      return origQuery(parameters);
+    };
+
+    // Override connection (automation often has no rtt)
+    if (navigator.connection) {
+      Object.defineProperty(navigator.connection, 'rtt', { get: () => 50 });
+    }
+
+    // Hide CDP artifacts
+    const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, 'hidden');
+    if (descriptor) {
+      Object.defineProperty(document, 'hidden', { get: () => false });
+      Object.defineProperty(document, 'visibilityState', { get: () => 'visible' });
+    }
+
+    // Override toString to not leak [native code] changes
+    const oldCall = Function.prototype.toString.call;
+    function overrideToString(fn, str) {
+      const newFn = function() { 
+        if (this === fn) return str;
+        return oldCall.call(this);
+      };
+      fn.toString = newFn;
+    }
+    overrideToString(navigator.permissions.query, 'function query() { [native code] }');
+  });
 
   return {
     browser,
@@ -170,23 +247,14 @@ async function solveCloudflareCookies() {
       instance = await launchAntiDetectChrome();
       const page = await instance.context.newPage();
 
-      // Set extra headers yang realistis
-      await page.setExtraHTTPHeaders({
-        "Accept-Language": "en-US,en;q=0.9,id-ID;q=0.8",
+      // Navigate directly to target with Google referrer
+      // This is more reliable than navigating to Google first
+      console.log(`[CF BYPASS] Navigating to ${TARGET_ORIGIN} with Google referrer...`);
+      await page.goto(TARGET_ORIGIN, {
+        waitUntil: "domcontentloaded",
+        timeout: 30000,
+        referer: "https://www.google.com/",
       });
-
-      // Teknik botasaurus: visit via Google referrer untuk bypass connection challenge
-      console.log("[CF BYPASS] Navigating via Google referrer...");
-      await page.goto("https://www.google.com", { waitUntil: "domcontentloaded", timeout: 20000 });
-
-      // Small delay to look human
-      await new Promise((r) => setTimeout(r, 1000 + Math.random() * 2000));
-
-      // Navigate ke target dari Google (simulating Google search click)
-      console.log(`[CF BYPASS] Navigating to ${TARGET_ORIGIN}...`);
-      await page.evaluate((url) => {
-        window.location.href = url;
-      }, TARGET_ORIGIN);
 
       // Wait for Cloudflare challenge to resolve
       console.log("[CF BYPASS] Waiting for Cloudflare challenge to resolve...");
@@ -245,96 +313,132 @@ async function solveCloudflareCookies() {
  */
 async function waitForCloudflareToPass(page) {
   const startTime = Date.now();
-  let clickAttempted = false;
 
-  // First wait for initial page load
+  // Phase 1: Wait for initial load and let CF JS challenge auto-solve (15s)
+  // Many CF challenges auto-complete if the browser looks legitimate
+  console.log("[CF BYPASS] Phase 1: Waiting for auto-solve (15s)...");
   try {
-    await page.waitForLoadState("domcontentloaded", { timeout: 15000 });
-  } catch (e) {
-    console.log("[CF BYPASS] Initial load timeout, continuing...");
-  }
+    await page.waitForLoadState("domcontentloaded", { timeout: 10000 });
+  } catch (e) {}
 
-  while (Date.now() - startTime < CF_SOLVE_TIMEOUT_MS) {
+  // Wait 15 seconds for auto-solve attempt
+  for (let i = 0; i < 10; i++) {
+    await new Promise((r) => setTimeout(r, 1500));
     try {
-      const url = page.url();
       const title = await page.title();
-
-      // Log current state for debugging
+      const url = page.url();
       const elapsed = Math.round((Date.now() - startTime) / 1000);
-      console.log(`[CF BYPASS] [${elapsed}s] URL: ${url.substring(0, 80)} | Title: ${title.substring(0, 50)}`);
+      console.log(`[CF BYPASS] [${elapsed}s] Title: ${title.substring(0, 50)} | URL: ${url.substring(0, 60)}`);
 
-      // Check if we're past Cloudflare
-      const isCFChallenge =
-        title.includes("Just a moment") ||
-        title.includes("Checking your browser") ||
-        title.includes("Attention Required") ||
-        title.includes("Verify you are human") ||
-        url.includes("challenge");
-
-      if (!isCFChallenge && url.includes(TARGET_HOSTNAME)) {
-        // Extra wait to let cookies settle
+      if (!isCFChallengePage(title) && url.includes(TARGET_HOSTNAME)) {
         await new Promise((r) => setTimeout(r, 2000));
-        console.log("[CF BYPASS] Cloudflare challenge passed!");
+        console.log("[CF BYPASS] Challenge auto-solved!");
         return true;
       }
+    } catch (e) {}
+  }
 
-      // Try to interact with Turnstile challenge
-      if (!clickAttempted) {
-        try {
-          // Wait a bit for the challenge to fully render
-          await new Promise((r) => setTimeout(r, 3000));
+  // Phase 2: Try human-like Turnstile interaction
+  console.log("[CF BYPASS] Phase 2: Attempting human-like Turnstile interaction...");
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (Date.now() - startTime > CF_SOLVE_TIMEOUT_MS) break;
 
-          // Method 1: Find Turnstile iframe and click checkbox
-          const frames = page.frames();
-          for (const frame of frames) {
-            if (frame.url().includes("challenges.cloudflare.com")) {
-              console.log("[CF BYPASS] Found Turnstile iframe, attempting click...");
-              // Try clicking at common checkbox position
-              try {
-                await frame.click('body', { position: { x: 30, y: 30 }, timeout: 3000 });
-                clickAttempted = true;
-                console.log("[CF BYPASS] Clicked inside Turnstile iframe");
-              } catch (clickErr) {
-                // Try alternative: click the checkbox input
-                try {
-                  await frame.click('input[type="checkbox"]', { timeout: 2000 });
-                  clickAttempted = true;
-                  console.log("[CF BYPASS] Clicked Turnstile checkbox");
-                } catch (e2) {}
-              }
-              break;
-            }
-          }
-
-          // Method 2: Click at approximate position on main page
-          if (!clickAttempted) {
-            try {
-              // Turnstile widget is usually at a specific position
-              await page.mouse.click(160, 290);
-              console.log("[CF BYPASS] Clicked at Turnstile widget position");
-              clickAttempted = true;
-            } catch (e) {}
-          }
-        } catch (e) {
-          // Interaction failed, will retry
+    try {
+      // Find Turnstile iframe
+      const frames = page.frames();
+      let turnstileFrame = null;
+      for (const frame of frames) {
+        if (frame.url().includes("challenges.cloudflare.com")) {
+          turnstileFrame = frame;
+          break;
         }
       }
 
-      // If we already clicked, check again after waiting for it to process
-      if (clickAttempted) {
-        await new Promise((r) => setTimeout(r, 5000));
-        clickAttempted = false; // Allow retry
+      if (turnstileFrame) {
+        console.log(`[CF BYPASS] Attempt ${attempt + 1}: Found Turnstile iframe`);
+
+        // Get iframe bounding box on the main page
+        const iframeElement = await page.$('iframe[src*="challenges.cloudflare.com"]');
+        if (iframeElement) {
+          const box = await iframeElement.boundingBox();
+          if (box) {
+            // The checkbox is typically at ~30,30 inside the iframe
+            const targetX = box.x + 30;
+            const targetY = box.y + 30;
+
+            console.log(`[CF BYPASS] Turnstile iframe at (${Math.round(box.x)}, ${Math.round(box.y)}), clicking checkbox at (${Math.round(targetX)}, ${Math.round(targetY)})`);
+
+            // Human-like mouse movement: start from random position
+            const startX = 300 + Math.random() * 400;
+            const startY = 200 + Math.random() * 300;
+            await page.mouse.move(startX, startY);
+            await new Promise((r) => setTimeout(r, 200 + Math.random() * 300));
+
+            // Move to target with realistic steps
+            const steps = 15 + Math.floor(Math.random() * 15);
+            await page.mouse.move(targetX, targetY, { steps });
+            await new Promise((r) => setTimeout(r, 100 + Math.random() * 200));
+
+            // Click with slight random offset
+            await page.mouse.click(
+              targetX + (Math.random() * 4 - 2),
+              targetY + (Math.random() * 4 - 2),
+              { delay: 50 + Math.random() * 80 }
+            );
+            console.log("[CF BYPASS] Clicked Turnstile with human-like movement");
+          }
+        }
+      } else {
+        console.log(`[CF BYPASS] Attempt ${attempt + 1}: No Turnstile iframe found, trying page click`);
+        // Try clicking where Turnstile usually appears
+        await humanMouseMove(page, 160, 290);
+        await page.mouse.click(160, 290, { delay: 60 + Math.random() * 80 });
+      }
+
+      // Wait for result after clicking
+      console.log("[CF BYPASS] Waiting for challenge resolution after click...");
+      for (let j = 0; j < 8; j++) {
+        await new Promise((r) => setTimeout(r, 2000));
+        try {
+          const title = await page.title();
+          const url = page.url();
+          const elapsed = Math.round((Date.now() - startTime) / 1000);
+          console.log(`[CF BYPASS] [${elapsed}s] Title: ${title.substring(0, 50)}`);
+
+          if (!isCFChallengePage(title) && url.includes(TARGET_HOSTNAME)) {
+            await new Promise((r) => setTimeout(r, 2000));
+            console.log("[CF BYPASS] Challenge passed after click!");
+            return true;
+          }
+        } catch (e) {}
       }
     } catch (e) {
-      // Page might be navigating
-      console.log(`[CF BYPASS] Navigation in progress: ${e.message.substring(0, 50)}`);
+      console.log(`[CF BYPASS] Interaction error: ${e.message.substring(0, 60)}`);
     }
-
-    await new Promise((r) => setTimeout(r, 2000));
   }
 
   console.log("[CF BYPASS] Timeout waiting for Cloudflare challenge");
   return false;
+}
+
+function isCFChallengePage(title) {
+  return (
+    title.includes("Just a moment") ||
+    title.includes("Checking your browser") ||
+    title.includes("Attention Required") ||
+    title.includes("Verify you are human") ||
+    title.includes("Security check")
+  );
+}
+
+async function humanMouseMove(page, targetX, targetY) {
+  const startX = 100 + Math.random() * 600;
+  const startY = 100 + Math.random() * 400;
+  await page.mouse.move(startX, startY);
+  await new Promise((r) => setTimeout(r, 100 + Math.random() * 200));
+  const steps = 10 + Math.floor(Math.random() * 20);
+  await page.mouse.move(targetX, targetY, { steps });
+  await new Promise((r) => setTimeout(r, 80 + Math.random() * 150));
 }
 
 /**
