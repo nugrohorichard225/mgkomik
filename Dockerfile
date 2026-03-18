@@ -25,6 +25,8 @@ RUN apt-get update && apt-get install -y \
     libgconf-2-4 \
     libxshmfence1 \
     xvfb \
+    dbus \
+    dbus-x11 \
     python3 \
     python3-pip \
     --no-install-recommends \
@@ -36,6 +38,9 @@ RUN apt-get update && apt-get install -y \
 
 # Install botasaurus-driver Python package
 RUN pip3 install --break-system-packages botasaurus-driver
+
+# Create shared memory directory (Chrome needs it)
+RUN mkdir -p /dev/shm && chmod 1777 /dev/shm
 
 WORKDIR /app
 
@@ -53,4 +58,5 @@ ENV CHROME_PATH=/usr/bin/google-chrome-stable
 
 EXPOSE 3000
 
-CMD ["node", "server.js"]
+# Start dbus (Chrome needs it) then run server
+CMD dbus-daemon --system --fork 2>/dev/null; exec node server.js

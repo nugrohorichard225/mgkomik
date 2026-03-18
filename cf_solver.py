@@ -18,10 +18,7 @@ def solve(url):
         chrome_executable_path=chrome_path,
         arguments=[
             "--disable-gpu",
-            "--disable-setuid-sandbox",
-            "--disable-software-rasterizer",
-            "--no-zygote",
-            "--single-process",
+            "--disable-dev-shm-usage",
         ],
     )
     try:
