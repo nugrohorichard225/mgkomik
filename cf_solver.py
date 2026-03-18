@@ -11,7 +11,19 @@ import os
 def solve(url):
     from botasaurus_driver import Driver
 
-    driver = Driver(headless=False, wait_for_complete_page_load=True)
+    chrome_path = os.environ.get("CHROME_PATH")
+    driver = Driver(
+        headless=False,
+        wait_for_complete_page_load=True,
+        chrome_executable_path=chrome_path,
+        arguments=[
+            "--disable-gpu",
+            "--disable-setuid-sandbox",
+            "--disable-software-rasterizer",
+            "--no-zygote",
+            "--single-process",
+        ],
+    )
     try:
         driver.google_get(url, bypass_cloudflare=True)
         cookies = driver.get_cookies_dict()
