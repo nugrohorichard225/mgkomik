@@ -1,0 +1,19 @@
+{
+  "name": "mgkomik",
+  "version": "1.0.0",
+  "description": "Mirror proxy with Cloudflare bypass using botasaurus approach",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js --no-sandbox"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "axios": "^1.7.7",
+    "jsdom": "^24.0.0",
+    "rebrowser-playwright-core": "^1.49.1",
+    "chrome-launcher": "^1.1.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
