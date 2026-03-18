@@ -1,6 +1,6 @@
 FROM node:18-slim
 
-# Install Google Chrome dependencies + Chrome
+# Install Google Chrome, Python3, Xvfb and dependencies
 RUN apt-get update && apt-get install -y \
     wget \
     gnupg \
@@ -25,6 +25,8 @@ RUN apt-get update && apt-get install -y \
     libgconf-2-4 \
     libxshmfence1 \
     xvfb \
+    python3 \
+    python3-pip \
     --no-install-recommends \
   && wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
   && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list \
@@ -32,21 +34,23 @@ RUN apt-get update && apt-get install -y \
   && apt-get install -y google-chrome-stable --no-install-recommends \
   && rm -rf /var/lib/apt/lists/*
 
+# Install botasaurus-driver Python package
+RUN pip3 install --break-system-packages botasaurus-driver
+
 WORKDIR /app
 
 # Copy package files and install dependencies
 COPY package.json ./
 RUN npm install --production
 
-# Copy app
-COPY server.js ./
+# Copy app files
+COPY server.js cf_solver.py ./
 
 # Railway uses PORT env variable
 ENV PORT=3000
-# Tell chrome-launcher where Chrome is
+# Tell botasaurus-driver where Chrome is
 ENV CHROME_PATH=/usr/bin/google-chrome-stable
 
 EXPOSE 3000
 
-# --no-sandbox is required for running Chrome in Docker
-CMD ["node", "server.js", "--no-sandbox"]
+CMD ["node", "server.js"]

@@ -2,11 +2,8 @@ const express = require("express");
 const axios = require("axios");
 const { JSDOM } = require("jsdom");
 const { URL } = require("url");
-
-// Botasaurus approach: rebrowser-playwright-core + chrome-launcher
-// These are ESM modules, loaded via dynamic import() in init()
-let chromium;
-let ChromeLauncher;
+const { execFile } = require("child_process");
+const path = require("path");
 
 const app = express();
 
@@ -60,171 +57,20 @@ function setCache(key, data, contentType, statusCode) {
 }
 
 // ============================================================
-// CLOUDFLARE BYPASS — Botasaurus approach
-// rebrowser-playwright-core + chrome-launcher
+// CLOUDFLARE BYPASS — Python botasaurus-driver approach
+// Uses proven botasaurus-driver CDP implementation for CF solving
 // ============================================================
-const { execSync } = require("child_process");
 
 let cfCookies = "";
 let cfUserAgent = "";
 let cfCookieTimestamp = 0;
 let isSolvingCF = false;
 let solvePromise = null;
-let xvfbStarted = false;
 
 /**
- * Start Xvfb virtual display so Chrome runs in headed mode
- * Headed mode is REQUIRED — headless is detected by Cloudflare
- */
-function ensureXvfb() {
-  if (xvfbStarted) return;
-  try {
-    // Kill any existing Xvfb
-    try { execSync("pkill -f Xvfb", { stdio: "ignore" }); } catch (e) {}
-    // Start Xvfb on display :99
-    execSync("Xvfb :99 -screen 0 1920x1080x24 -ac -nolisten tcp &", {
-      stdio: "ignore",
-      shell: true,
-    });
-    process.env.DISPLAY = ":99";
-    xvfbStarted = true;
-    console.log("[XVFB] Virtual display started on :99");
-  } catch (e) {
-    console.error("[XVFB] Failed to start:", e.message);
-  }
-}
-
-/**
- * Launch Chrome using botasaurus anti-detect flags
- * dan connect via CDP dengan rebrowser-playwright-core
- */
-async function launchAntiDetectChrome() {
-  // Ensure virtual display is running (headed mode required for CF bypass)
-  ensureXvfb();
-
-  const flags = [
-    "--start-maximized",
-    "--remote-allow-origins=*",
-    "--no-first-run",
-    "--no-service-autorun",
-    "--homepage=about:blank",
-    "--no-pings",
-    "--password-store=basic",
-    "--disable-infobars",
-    "--disable-breakpad",
-    "--disable-dev-shm-usage",
-    "--disable-session-crashed-bubble",
-    "--disable-features=IsolateOrigins,site-per-process",
-    "--disable-search-engine-choice-screen",
-    "--no-sandbox",
-    "--disable-gpu",
-    "--disable-setuid-sandbox",
-    "--window-size=1920,1080",
-    // Critical anti-detection flags
-    "--disable-blink-features=AutomationControlled",
-    "--disable-features=AutomationControlled",
-    "--disable-ipc-flooding-protection",
-    "--enable-features=NetworkService,NetworkServiceInProcess",
-    "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
-    // NO --headless flag! Headed mode is required to bypass Cloudflare
-  ];
-
-  // Launch real Chrome via chrome-launcher (like botasaurus page.ts)
-  const chrome = await ChromeLauncher.launch({
-    chromeFlags: flags,
-    chromePath: process.env.CHROME_PATH || undefined,
-  });
-
-  // Connect rebrowser-playwright-core via CDP (anti-detect playwright)
-  const browser = await chromium.connectOverCDP(`http://localhost:${chrome.port}`);
-  const context = browser.contexts()[0];
-
-  // Inject stealth scripts BEFORE any page loads
-  await context.addInitScript(() => {
-    // Hide webdriver flag
-    Object.defineProperty(navigator, 'webdriver', {
-      get: () => undefined,
-    });
-    // Remove automation-related properties
-    delete navigator.__proto__.webdriver;
-
-    // Add chrome runtime object (missing in automated browsers)
-    if (!window.chrome) {
-      window.chrome = {};
-    }
-    if (!window.chrome.runtime) {
-      window.chrome.runtime = {
-        onMessage: { addListener: function() {}, removeListener: function() {} },
-        sendMessage: function() {},
-        connect: function() { return { onMessage: { addListener: function() {} } }; },
-      };
-    }
-
-    // Override plugins to look real
-    Object.defineProperty(navigator, 'plugins', {
-      get: () => {
-        const plugins = [
-          { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-          { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
-          { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' },
-        ];
-        plugins.length = 3;
-        return plugins;
-      },
-    });
-
-    // Override languages
-    Object.defineProperty(navigator, 'languages', {
-      get: () => ['en-US', 'en', 'id'],
-    });
-
-    // Override permissions
-    const origQuery = navigator.permissions.query.bind(navigator.permissions);
-    navigator.permissions.query = (parameters) => {
-      if (parameters.name === 'notifications') {
-        return Promise.resolve({ state: 'prompt', onchange: null });
-      }
-      return origQuery(parameters);
-    };
-
-    // Override connection (automation often has no rtt)
-    if (navigator.connection) {
-      Object.defineProperty(navigator.connection, 'rtt', { get: () => 50 });
-    }
-
-    // Hide CDP artifacts
-    const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, 'hidden');
-    if (descriptor) {
-      Object.defineProperty(document, 'hidden', { get: () => false });
-      Object.defineProperty(document, 'visibilityState', { get: () => 'visible' });
-    }
-
-    // Override toString to not leak [native code] changes
-    const oldCall = Function.prototype.toString.call;
-    function overrideToString(fn, str) {
-      const newFn = function() { 
-        if (this === fn) return str;
-        return oldCall.call(this);
-      };
-      fn.toString = newFn;
-    }
-    overrideToString(navigator.permissions.query, 'function query() { [native code] }');
-  });
-
-  return {
-    browser,
-    context,
-    kill: async () => {
-      try { await context.close(); } catch (e) {}
-      try { await browser.close(); } catch (e) {}
-      try { await chrome.kill(); } catch (e) {}
-    },
-  };
-}
-
-/**
- * Solve Cloudflare challenge dan extract cookies
- * Menggunakan teknik Google Referrer seperti botasaurus google_get
+ * Solve Cloudflare challenge using Python botasaurus-driver
+ * This calls cf_solver.py which uses the proven botasaurus CDP browser
+ * with shadow root Turnstile solving
  */
 async function solveCloudflareCookies() {
   // Prevent multiple simultaneous solves
@@ -240,64 +86,28 @@ async function solveCloudflareCookies() {
 
   isSolvingCF = true;
   solvePromise = (async () => {
-    console.log("[CF BYPASS] Launching anti-detect Chrome (HEADED mode via Xvfb)...");
-    let instance = null;
+    console.log("[CF BYPASS] Starting botasaurus-driver Python solver...");
 
     try {
-      instance = await launchAntiDetectChrome();
-      const page = await instance.context.newPage();
+      const result = await runPythonSolver(TARGET_ORIGIN);
 
-      // Navigate directly to target with Google referrer
-      // This is more reliable than navigating to Google first
-      console.log(`[CF BYPASS] Navigating to ${TARGET_ORIGIN} with Google referrer...`);
-      await page.goto(TARGET_ORIGIN, {
-        waitUntil: "domcontentloaded",
-        timeout: 30000,
-        referer: "https://www.google.com/",
-      });
-
-      // Wait for Cloudflare challenge to resolve
-      console.log("[CF BYPASS] Waiting for Cloudflare challenge to resolve...");
-      const passed = await waitForCloudflareToPass(page);
-
-      // Extract cookies
-      const cookies = await instance.context.cookies(TARGET_ORIGIN);
-      const cfClearance = cookies.find((c) => c.name === "cf_clearance");
-      const cookieStr = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
-
-      // Get the actual User-Agent used by the browser
-      const browserUA = await page.evaluate(() => navigator.userAgent);
-
-      if (cfClearance) {
-        console.log(`[CF BYPASS] SUCCESS! Got cf_clearance cookie`);
-        console.log(`[CF BYPASS] All cookies: ${cookies.map((c) => c.name).join(", ")}`);
-        cfCookies = cookieStr;
-        cfUserAgent = browserUA;
+      if (result.success && result.cookieString) {
+        console.log(`[CF BYPASS] SUCCESS! Got cookies: ${Object.keys(result.cookies).join(", ")}`);
+        console.log(`[CF BYPASS] Page title: ${result.title}`);
+        cfCookies = result.cookieString;
+        cfUserAgent = result.userAgent;
         cfCookieTimestamp = Date.now();
         lastSolveFailTime = 0;
+        return { cookies: cfCookies, userAgent: cfUserAgent };
       } else {
-        console.log(`[CF BYPASS] WARNING: No cf_clearance cookie obtained (got ${cookies.length} cookies: ${cookies.map((c) => c.name).join(", ")})`);
-        // Still set what we got — some sites work without cf_clearance
-        if (cookies.length > 0) {
-          cfCookies = cookieStr;
-          cfUserAgent = browserUA;
-          cfCookieTimestamp = Date.now();
-        } else {
-          lastSolveFailTime = Date.now();
-        }
+        const errMsg = result.error || "No cookies obtained";
+        console.error(`[CF BYPASS] Solver returned failure: ${errMsg}`);
+        lastSolveFailTime = Date.now();
+        throw new Error(errMsg);
       }
-
-      await page.close();
-      await instance.kill();
-      instance = null;
-
-      return { cookies: cfCookies, userAgent: cfUserAgent || browserUA };
     } catch (error) {
       console.error(`[CF BYPASS] Failed: ${error.message}`);
       lastSolveFailTime = Date.now();
-      if (instance) {
-        try { await instance.kill(); } catch (e) {}
-      }
       throw error;
     } finally {
       isSolvingCF = false;
@@ -309,136 +119,47 @@ async function solveCloudflareCookies() {
 }
 
 /**
- * Wait for Cloudflare challenge page to finish
+ * Run the Python cf_solver.py script and parse JSON output
  */
-async function waitForCloudflareToPass(page) {
-  const startTime = Date.now();
+function runPythonSolver(url) {
+  return new Promise((resolve, reject) => {
+    const scriptPath = path.join(__dirname, "cf_solver.py");
+    const timeout = CF_SOLVE_TIMEOUT_MS + 30000; // Extra buffer for browser startup
 
-  // Phase 1: Wait for initial load and let CF JS challenge auto-solve (15s)
-  // Many CF challenges auto-complete if the browser looks legitimate
-  console.log("[CF BYPASS] Phase 1: Waiting for auto-solve (15s)...");
-  try {
-    await page.waitForLoadState("domcontentloaded", { timeout: 10000 });
-  } catch (e) {}
+    console.log(`[CF BYPASS] Executing: python3 ${scriptPath} ${url}`);
 
-  // Wait 15 seconds for auto-solve attempt
-  for (let i = 0; i < 10; i++) {
-    await new Promise((r) => setTimeout(r, 1500));
-    try {
-      const title = await page.title();
-      const url = page.url();
-      const elapsed = Math.round((Date.now() - startTime) / 1000);
-      console.log(`[CF BYPASS] [${elapsed}s] Title: ${title.substring(0, 50)} | URL: ${url.substring(0, 60)}`);
-
-      if (!isCFChallengePage(title) && url.includes(TARGET_HOSTNAME)) {
-        await new Promise((r) => setTimeout(r, 2000));
-        console.log("[CF BYPASS] Challenge auto-solved!");
-        return true;
-      }
-    } catch (e) {}
-  }
-
-  // Phase 2: Try human-like Turnstile interaction
-  console.log("[CF BYPASS] Phase 2: Attempting human-like Turnstile interaction...");
-  for (let attempt = 0; attempt < 3; attempt++) {
-    if (Date.now() - startTime > CF_SOLVE_TIMEOUT_MS) break;
-
-    try {
-      // Find Turnstile iframe
-      const frames = page.frames();
-      let turnstileFrame = null;
-      for (const frame of frames) {
-        if (frame.url().includes("challenges.cloudflare.com")) {
-          turnstileFrame = frame;
-          break;
+    const child = execFile(
+      "python3",
+      [scriptPath, url],
+      {
+        timeout,
+        maxBuffer: 5 * 1024 * 1024,
+        env: { ...process.env, PYTHONUNBUFFERED: "1" },
+      },
+      (error, stdout, stderr) => {
+        if (stderr) {
+          // botasaurus-driver prints progress info to stderr
+          console.log(`[CF BYPASS] Python output: ${stderr.substring(0, 500)}`);
         }
-      }
 
-      if (turnstileFrame) {
-        console.log(`[CF BYPASS] Attempt ${attempt + 1}: Found Turnstile iframe`);
-
-        // Get iframe bounding box on the main page
-        const iframeElement = await page.$('iframe[src*="challenges.cloudflare.com"]');
-        if (iframeElement) {
-          const box = await iframeElement.boundingBox();
-          if (box) {
-            // The checkbox is typically at ~30,30 inside the iframe
-            const targetX = box.x + 30;
-            const targetY = box.y + 30;
-
-            console.log(`[CF BYPASS] Turnstile iframe at (${Math.round(box.x)}, ${Math.round(box.y)}), clicking checkbox at (${Math.round(targetX)}, ${Math.round(targetY)})`);
-
-            // Human-like mouse movement: start from random position
-            const startX = 300 + Math.random() * 400;
-            const startY = 200 + Math.random() * 300;
-            await page.mouse.move(startX, startY);
-            await new Promise((r) => setTimeout(r, 200 + Math.random() * 300));
-
-            // Move to target with realistic steps
-            const steps = 15 + Math.floor(Math.random() * 15);
-            await page.mouse.move(targetX, targetY, { steps });
-            await new Promise((r) => setTimeout(r, 100 + Math.random() * 200));
-
-            // Click with slight random offset
-            await page.mouse.click(
-              targetX + (Math.random() * 4 - 2),
-              targetY + (Math.random() * 4 - 2),
-              { delay: 50 + Math.random() * 80 }
-            );
-            console.log("[CF BYPASS] Clicked Turnstile with human-like movement");
-          }
+        if (error) {
+          console.error(`[CF BYPASS] Python process error: ${error.message}`);
+          return reject(new Error(`Python solver failed: ${error.message}`));
         }
-      } else {
-        console.log(`[CF BYPASS] Attempt ${attempt + 1}: No Turnstile iframe found, trying page click`);
-        // Try clicking where Turnstile usually appears
-        await humanMouseMove(page, 160, 290);
-        await page.mouse.click(160, 290, { delay: 60 + Math.random() * 80 });
-      }
 
-      // Wait for result after clicking
-      console.log("[CF BYPASS] Waiting for challenge resolution after click...");
-      for (let j = 0; j < 8; j++) {
-        await new Promise((r) => setTimeout(r, 2000));
         try {
-          const title = await page.title();
-          const url = page.url();
-          const elapsed = Math.round((Date.now() - startTime) / 1000);
-          console.log(`[CF BYPASS] [${elapsed}s] Title: ${title.substring(0, 50)}`);
-
-          if (!isCFChallengePage(title) && url.includes(TARGET_HOSTNAME)) {
-            await new Promise((r) => setTimeout(r, 2000));
-            console.log("[CF BYPASS] Challenge passed after click!");
-            return true;
-          }
-        } catch (e) {}
+          // Find the JSON line in stdout (last non-empty line)
+          const lines = stdout.trim().split("\n");
+          const jsonLine = lines[lines.length - 1];
+          const result = JSON.parse(jsonLine);
+          resolve(result);
+        } catch (parseErr) {
+          console.error(`[CF BYPASS] Failed to parse output: ${stdout.substring(0, 200)}`);
+          reject(new Error(`Failed to parse solver output: ${parseErr.message}`));
+        }
       }
-    } catch (e) {
-      console.log(`[CF BYPASS] Interaction error: ${e.message.substring(0, 60)}`);
-    }
-  }
-
-  console.log("[CF BYPASS] Timeout waiting for Cloudflare challenge");
-  return false;
-}
-
-function isCFChallengePage(title) {
-  return (
-    title.includes("Just a moment") ||
-    title.includes("Checking your browser") ||
-    title.includes("Attention Required") ||
-    title.includes("Verify you are human") ||
-    title.includes("Security check")
-  );
-}
-
-async function humanMouseMove(page, targetX, targetY) {
-  const startX = 100 + Math.random() * 600;
-  const startY = 100 + Math.random() * 400;
-  await page.mouse.move(startX, startY);
-  await new Promise((r) => setTimeout(r, 100 + Math.random() * 200));
-  const steps = 10 + Math.floor(Math.random() * 20);
-  await page.mouse.move(targetX, targetY, { steps });
-  await new Promise((r) => setTimeout(r, 80 + Math.random() * 150));
+    );
+  });
 }
 
 /**
@@ -913,46 +634,34 @@ function escapeRegex(string) {
 // START SERVER — Pre-solve Cloudflare on startup
 // ============================================================
 // ============================================================
-// INIT — Load ESM modules then start server
+// START SERVER
 // ============================================================
-async function init() {
-  // Dynamic import for ESM-only packages
-  const pw = await import("rebrowser-playwright-core");
-  chromium = pw.chromium;
-  ChromeLauncher = await import("chrome-launcher");
+app.listen(PORT, async () => {
+  console.log(`🚀 Mirror proxy running on port ${PORT}`);
+  console.log(`📡 Target: ${TARGET_ORIGIN}`);
+  console.log(`💡 Mirror domain: ${MANUAL_MIRROR_DOMAIN || "(auto-detect from request)"}`);
+  console.log(`🔐 Using botasaurus-driver (Python) for Cloudflare bypass`);
 
-  app.listen(PORT, async () => {
-    console.log(`🚀 Mirror proxy running on port ${PORT}`);
-    console.log(`📡 Target: ${TARGET_ORIGIN}`);
-    console.log(`💡 Mirror domain: ${MANUAL_MIRROR_DOMAIN || "(auto-detect from request)"}`);
-    console.log(`🔐 Using Botasaurus anti-detect approach for Cloudflare bypass`);
+  // Pre-solve Cloudflare cookies on startup
+  try {
+    console.log("[STARTUP] Pre-solving Cloudflare cookies via botasaurus-driver...");
+    await solveCloudflareCookies();
+    console.log("[STARTUP] Cloudflare cookies obtained successfully!");
+  } catch (e) {
+    console.error("[STARTUP] Failed to pre-solve Cloudflare:", e.message);
+    console.log("[STARTUP] Will retry on first request...");
+  }
 
-    // Pre-solve Cloudflare cookies on startup
+  // Schedule periodic cookie refresh
+  setInterval(async () => {
     try {
-      console.log("[STARTUP] Pre-solving Cloudflare cookies...");
+      console.log("[REFRESH] Refreshing Cloudflare cookies...");
       await solveCloudflareCookies();
-      console.log("[STARTUP] Cloudflare cookies obtained successfully!");
+      console.log("[REFRESH] Cloudflare cookies refreshed!");
     } catch (e) {
-      console.error("[STARTUP] Failed to pre-solve Cloudflare:", e.message);
-      console.log("[STARTUP] Will retry on first request...");
+      console.error("[REFRESH] Failed to refresh CF cookies:", e.message);
     }
-
-    // Schedule periodic cookie refresh
-    setInterval(async () => {
-      try {
-        console.log("[REFRESH] Refreshing Cloudflare cookies...");
-        await solveCloudflareCookies();
-        console.log("[REFRESH] Cloudflare cookies refreshed!");
-      } catch (e) {
-        console.error("[REFRESH] Failed to refresh CF cookies:", e.message);
-      }
-    }, CF_COOKIE_REFRESH_MS);
-  });
-}
-
-init().catch((err) => {
-  console.error("[FATAL] Failed to initialize:", err);
-  process.exit(1);
+  }, CF_COOKIE_REFRESH_MS);
 });
 
 // ============================================================
