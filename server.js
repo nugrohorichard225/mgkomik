@@ -21,8 +21,11 @@ const CACHE_TTL_SECONDS = 300;
 
 // Cloudflare cookie refresh interval (25 menit, sebelum expired ~30 menit)
 const CF_COOKIE_REFRESH_MS = 25 * 60 * 1000;
-// Max wait for Cloudflare challenge to solve (detik)
-const CF_SOLVE_TIMEOUT_MS = 30000;
+// Max wait for Cloudflare challenge to solve
+const CF_SOLVE_TIMEOUT_MS = 60000;
+// Cooldown setelah solve gagal (60 detik) — prevent infinite retry
+const CF_SOLVE_COOLDOWN_MS = 60000;
+let lastSolveFailTime = 0;
 
 // ============================================================
 // IN-MEMORY CACHE
@@ -60,17 +63,45 @@ function setCache(key, data, contentType, statusCode) {
 // CLOUDFLARE BYPASS — Botasaurus approach
 // rebrowser-playwright-core + chrome-launcher
 // ============================================================
+const { execSync } = require("child_process");
+
 let cfCookies = "";
 let cfUserAgent = "";
 let cfCookieTimestamp = 0;
 let isSolvingCF = false;
 let solvePromise = null;
+let xvfbStarted = false;
+
+/**
+ * Start Xvfb virtual display so Chrome runs in headed mode
+ * Headed mode is REQUIRED — headless is detected by Cloudflare
+ */
+function ensureXvfb() {
+  if (xvfbStarted) return;
+  try {
+    // Kill any existing Xvfb
+    try { execSync("pkill -f Xvfb", { stdio: "ignore" }); } catch (e) {}
+    // Start Xvfb on display :99
+    execSync("Xvfb :99 -screen 0 1920x1080x24 -ac -nolisten tcp &", {
+      stdio: "ignore",
+      shell: true,
+    });
+    process.env.DISPLAY = ":99";
+    xvfbStarted = true;
+    console.log("[XVFB] Virtual display started on :99");
+  } catch (e) {
+    console.error("[XVFB] Failed to start:", e.message);
+  }
+}
 
 /**
  * Launch Chrome using botasaurus anti-detect flags
  * dan connect via CDP dengan rebrowser-playwright-core
  */
 async function launchAntiDetectChrome() {
+  // Ensure virtual display is running (headed mode required for CF bypass)
+  ensureXvfb();
+
   const flags = [
     "--start-maximized",
     "--remote-allow-origins=*",
@@ -89,7 +120,8 @@ async function launchAntiDetectChrome() {
     "--disable-gpu",
     "--disable-setuid-sandbox",
     "--disable-extensions",
-    "--headless=new",
+    "--window-size=1920,1080",
+    // NO --headless flag! Headed mode is required to bypass Cloudflare
   ];
 
   // Launch real Chrome via chrome-launcher (like botasaurus page.ts)
@@ -123,9 +155,15 @@ async function solveCloudflareCookies() {
     return solvePromise;
   }
 
+  // Cooldown to prevent infinite retry storms
+  if (lastSolveFailTime && Date.now() - lastSolveFailTime < CF_SOLVE_COOLDOWN_MS) {
+    console.log("[CF BYPASS] In cooldown period, skipping solve attempt");
+    return { cookies: cfCookies, userAgent: cfUserAgent };
+  }
+
   isSolvingCF = true;
   solvePromise = (async () => {
-    console.log("[CF BYPASS] Launching anti-detect Chrome to solve Cloudflare...");
+    console.log("[CF BYPASS] Launching anti-detect Chrome (HEADED mode via Xvfb)...");
     let instance = null;
 
     try {
@@ -139,7 +177,10 @@ async function solveCloudflareCookies() {
 
       // Teknik botasaurus: visit via Google referrer untuk bypass connection challenge
       console.log("[CF BYPASS] Navigating via Google referrer...");
-      await page.goto("https://www.google.com", { waitUntil: "domcontentloaded", timeout: 15000 });
+      await page.goto("https://www.google.com", { waitUntil: "domcontentloaded", timeout: 20000 });
+
+      // Small delay to look human
+      await new Promise((r) => setTimeout(r, 1000 + Math.random() * 2000));
 
       // Navigate ke target dari Google (simulating Google search click)
       console.log(`[CF BYPASS] Navigating to ${TARGET_ORIGIN}...`);
@@ -149,29 +190,43 @@ async function solveCloudflareCookies() {
 
       // Wait for Cloudflare challenge to resolve
       console.log("[CF BYPASS] Waiting for Cloudflare challenge to resolve...");
-      await waitForCloudflareToPass(page);
+      const passed = await waitForCloudflareToPass(page);
 
       // Extract cookies
       const cookies = await instance.context.cookies(TARGET_ORIGIN);
+      const cfClearance = cookies.find((c) => c.name === "cf_clearance");
       const cookieStr = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
 
       // Get the actual User-Agent used by the browser
       const browserUA = await page.evaluate(() => navigator.userAgent);
 
-      console.log(`[CF BYPASS] Success! Got ${cookies.length} cookies`);
-      console.log(`[CF BYPASS] Cookies: ${cookies.map((c) => c.name).join(", ")}`);
-
-      cfCookies = cookieStr;
-      cfUserAgent = browserUA;
-      cfCookieTimestamp = Date.now();
+      if (cfClearance) {
+        console.log(`[CF BYPASS] SUCCESS! Got cf_clearance cookie`);
+        console.log(`[CF BYPASS] All cookies: ${cookies.map((c) => c.name).join(", ")}`);
+        cfCookies = cookieStr;
+        cfUserAgent = browserUA;
+        cfCookieTimestamp = Date.now();
+        lastSolveFailTime = 0;
+      } else {
+        console.log(`[CF BYPASS] WARNING: No cf_clearance cookie obtained (got ${cookies.length} cookies: ${cookies.map((c) => c.name).join(", ")})`);
+        // Still set what we got — some sites work without cf_clearance
+        if (cookies.length > 0) {
+          cfCookies = cookieStr;
+          cfUserAgent = browserUA;
+          cfCookieTimestamp = Date.now();
+        } else {
+          lastSolveFailTime = Date.now();
+        }
+      }
 
       await page.close();
       await instance.kill();
       instance = null;
 
-      return { cookies: cookieStr, userAgent: cfUserAgent };
+      return { cookies: cfCookies, userAgent: cfUserAgent || browserUA };
     } catch (error) {
       console.error(`[CF BYPASS] Failed: ${error.message}`);
+      lastSolveFailTime = Date.now();
       if (instance) {
         try { await instance.kill(); } catch (e) {}
       }
@@ -190,50 +245,95 @@ async function solveCloudflareCookies() {
  */
 async function waitForCloudflareToPass(page) {
   const startTime = Date.now();
+  let clickAttempted = false;
+
+  // First wait for initial page load
+  try {
+    await page.waitForLoadState("domcontentloaded", { timeout: 15000 });
+  } catch (e) {
+    console.log("[CF BYPASS] Initial load timeout, continuing...");
+  }
 
   while (Date.now() - startTime < CF_SOLVE_TIMEOUT_MS) {
     try {
       const url = page.url();
       const title = await page.title();
-      const content = await page.content();
 
-      // Cloudflare challenge indicators
+      // Log current state for debugging
+      const elapsed = Math.round((Date.now() - startTime) / 1000);
+      console.log(`[CF BYPASS] [${elapsed}s] URL: ${url.substring(0, 80)} | Title: ${title.substring(0, 50)}`);
+
+      // Check if we're past Cloudflare
       const isCFChallenge =
         title.includes("Just a moment") ||
         title.includes("Checking your browser") ||
         title.includes("Attention Required") ||
-        content.includes("cf-challenge-running") ||
-        content.includes("cf_chl_opt") ||
-        content.includes("Checking if the site connection is secure");
+        title.includes("Verify you are human") ||
+        url.includes("challenge");
 
       if (!isCFChallenge && url.includes(TARGET_HOSTNAME)) {
+        // Extra wait to let cookies settle
+        await new Promise((r) => setTimeout(r, 2000));
         console.log("[CF BYPASS] Cloudflare challenge passed!");
         return true;
       }
 
-      // Check if Turnstile iframe is present and try to interact
-      try {
-        const turnstileFrame = page.frames().find(
-          (f) => f.url().includes("challenges.cloudflare.com")
-        );
-        if (turnstileFrame) {
-          const checkbox = await turnstileFrame.$('input[type="checkbox"]');
-          if (checkbox) {
-            await checkbox.click();
-            console.log("[CF BYPASS] Clicked Turnstile checkbox");
+      // Try to interact with Turnstile challenge
+      if (!clickAttempted) {
+        try {
+          // Wait a bit for the challenge to fully render
+          await new Promise((r) => setTimeout(r, 3000));
+
+          // Method 1: Find Turnstile iframe and click checkbox
+          const frames = page.frames();
+          for (const frame of frames) {
+            if (frame.url().includes("challenges.cloudflare.com")) {
+              console.log("[CF BYPASS] Found Turnstile iframe, attempting click...");
+              // Try clicking at common checkbox position
+              try {
+                await frame.click('body', { position: { x: 30, y: 30 }, timeout: 3000 });
+                clickAttempted = true;
+                console.log("[CF BYPASS] Clicked inside Turnstile iframe");
+              } catch (clickErr) {
+                // Try alternative: click the checkbox input
+                try {
+                  await frame.click('input[type="checkbox"]', { timeout: 2000 });
+                  clickAttempted = true;
+                  console.log("[CF BYPASS] Clicked Turnstile checkbox");
+                } catch (e2) {}
+              }
+              break;
+            }
           }
+
+          // Method 2: Click at approximate position on main page
+          if (!clickAttempted) {
+            try {
+              // Turnstile widget is usually at a specific position
+              await page.mouse.click(160, 290);
+              console.log("[CF BYPASS] Clicked at Turnstile widget position");
+              clickAttempted = true;
+            } catch (e) {}
+          }
+        } catch (e) {
+          // Interaction failed, will retry
         }
-      } catch (e) {
-        // Frame interaction might fail, that's ok
+      }
+
+      // If we already clicked, check again after waiting for it to process
+      if (clickAttempted) {
+        await new Promise((r) => setTimeout(r, 5000));
+        clickAttempted = false; // Allow retry
       }
     } catch (e) {
       // Page might be navigating
+      console.log(`[CF BYPASS] Navigation in progress: ${e.message.substring(0, 50)}`);
     }
 
-    await new Promise((r) => setTimeout(r, 1500));
+    await new Promise((r) => setTimeout(r, 2000));
   }
 
-  console.log("[CF BYPASS] Timeout waiting for Cloudflare, attempting to continue...");
+  console.log("[CF BYPASS] Timeout waiting for Cloudflare challenge");
   return false;
 }
 
@@ -384,13 +484,28 @@ app.all("*", async (req, res) => {
     const contentType = response.headers["content-type"] || "";
     const statusCode = response.status;
 
-    // If 403 — Cloudflare blocking, force re-solve and retry
+    // If 403 — Cloudflare blocking, force ONE re-solve and retry
     if (statusCode === 403) {
-      console.log("[PROXY] Got 403, forcing Cloudflare cookie refresh...");
+      // Check cooldown to prevent infinite loop
+      if (lastSolveFailTime && Date.now() - lastSolveFailTime < CF_SOLVE_COOLDOWN_MS) {
+        console.log("[PROXY] 403 received but in cooldown, returning error");
+        return res.status(503).send(
+          "<h1>Service Temporarily Unavailable</h1><p>Cloudflare bypass is refreshing. Please try again in 1 minute.</p>"
+        );
+      }
+
+      console.log("[PROXY] Got 403, forcing Cloudflare cookie refresh (single attempt)...");
       cfCookieTimestamp = 0;
 
       try {
         const freshCF = await solveCloudflareCookies();
+
+        if (!freshCF.cookies) {
+          return res.status(503).send(
+            "<h1>Service Temporarily Unavailable</h1><p>Cloudflare bypass failed. Please try again later.</p>"
+          );
+        }
+
         proxyHeaders["Cookie"] = freshCF.cookies;
         proxyHeaders["User-Agent"] = freshCF.userAgent;
 
@@ -410,9 +525,10 @@ app.all("*", async (req, res) => {
         const retryStatusCode = retryResponse.status;
 
         if (retryStatusCode === 403) {
-          return res
-            .status(403)
-            .send("Target server denied access (403). Cloudflare protection could not be bypassed.");
+          lastSolveFailTime = Date.now();
+          return res.status(503).send(
+            "<h1>Service Temporarily Unavailable</h1><p>Cloudflare protection could not be bypassed. Retrying in 1 minute.</p>"
+          );
         }
 
         return processResponse(
@@ -421,9 +537,10 @@ app.all("*", async (req, res) => {
         );
       } catch (retryErr) {
         console.error("[PROXY] Retry after CF solve failed:", retryErr.message);
-        return res
-          .status(403)
-          .send("Target server denied access (403). Cloudflare bypass failed.");
+        lastSolveFailTime = Date.now();
+        return res.status(503).send(
+          "<h1>Service Temporarily Unavailable</h1><p>Cloudflare bypass failed. Please try again later.</p>"
+        );
       }
     }
 

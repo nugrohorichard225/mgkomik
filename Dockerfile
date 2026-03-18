@@ -24,6 +24,7 @@ RUN apt-get update && apt-get install -y \
     libxss1 \
     libgconf-2-4 \
     libxshmfence1 \
+    xvfb \
     --no-install-recommends \
   && wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
   && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list \
